@@ -16,8 +16,9 @@ import type {
   SelectField,
 } from 'payload'
 import { entityToJSONSchema } from 'payload'
-import type { SanitizedPluginOptions } from '../types.js'
+import type { CustomEndpointDocumentation, SanitizedPluginOptions } from '../types.js'
 import { mapValuesAsync, visitObjectNodes } from '../utils/objects.js'
+import { upperFirst } from '../utils/strings.js'
 import { type ComponentType, collectionName, componentName, globalName } from './naming.js'
 import { apiKeySecurity, generateSecuritySchemes } from './securitySchemes.js'
 
@@ -102,27 +103,47 @@ const generateSchemaObject = (config: SanitizedConfig, collection: Collection): 
   }
 }
 
-type RequestBodyType = 'post' | 'patch'
+const generateCustomEndpointSchemaObjects = (collection: Collection) => {
+  const schemas: Record<string, JSONSchema4> = {}
+  const { singular } = collectionName(collection)
+
+  for (const endpoint of collection.config.endpoints || []) {
+    if (endpoint.custom?.openapi) {
+      const { parameters, ...documentation }: CustomEndpointDocumentation = endpoint.custom.openapi
+
+      for (const [statusCode, response] of Object.entries(documentation.responses || {})) {
+        const key = componentName('schemas', singular, {
+          suffix: `CustomEndpoint${upperFirst(endpoint.method)}${statusCode}`,
+        })
+
+        schemas[key] = response
+      }
+    }
+  }
+
+  return schemas
+}
 
 const requestBodySchema = (fields: Array<Field>, schema: JSONSchema4): JSONSchema4 => ({
   ...schema,
   properties: Object.fromEntries(
-    Object.entries(schema.properties ?? {}).map(([fieldName, schema]) => {
-      const field = fields.find(field => (field as FieldBase).name === fieldName)
-      if (field?.type === 'relationship') {
-        const target = Array.isArray(field.relationTo) ? field.relationTo : [field.relationTo]
-        return [fieldName, { type: 'string', description: `ID of the ${target.join('/')}` }]
-      }
+    Object.entries(schema.properties ?? {})
+      .filter(([slug]) => !['id', 'createdAt', 'updatedAt'].includes(slug))
+      .map(([fieldName, schema]) => {
+        const field = fields.find(field => (field as FieldBase).name === fieldName)
+        if (field?.type === 'relationship') {
+          const target = Array.isArray(field.relationTo) ? field.relationTo : [field.relationTo]
+          return [fieldName, { type: 'string', description: `ID of the ${target.join('/')}` }]
+        }
 
-      return [fieldName, schema]
-    }),
+        return [fieldName, schema]
+      }),
   ),
 })
 
 const generateRequestBodySchema = (
   config: SanitizedConfig,
   collection: Collection,
-  type: RequestBodyType,
 ): OpenAPIV3_1.RequestBodyObject => {
   const schema = entityToJSONSchema(
     config,
@@ -131,20 +152,6 @@ const generateRequestBodySchema = (
     'text',
     undefined,
   )
-
-  schema.properties = Object.fromEntries(
-    Object.entries(schema.properties ?? {}).filter(
-      ([property]) => !['id', 'createdAt', 'updatedAt'].includes(property),
-    ),
-  )
-  schema.required = ((schema.required ?? []) as string[]).filter(
-    property => schema.properties?.[property] !== undefined,
-  )
-
-  if (type === 'patch') {
-    schema.required = []
-  }
-
   return {
     description: collectionName(collection).singular,
     content: {
@@ -153,6 +160,48 @@ const generateRequestBodySchema = (
       },
     },
   }
+}
+
+const getRequestBodySchema = (
+  description: string,
+  schema: OpenAPIV3_1.SchemaObject,
+): OpenAPIV3_1.RequestBodyObject => {
+  return {
+    description,
+    content: {
+      'application/json': {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          ...schema,
+        },
+      },
+    },
+  }
+}
+
+const generateRequestBodyCustomEndpointSchemas = (collection: Collection) => {
+  const requestBodies: Record<string, OpenAPIV3_1.RequestBodyObject> = {}
+  const { singular } = collectionName(collection)
+
+  for (const endpoint of collection.config.endpoints || []) {
+    if (endpoint.custom?.openapi) {
+      const { parameters, ...documentation }: CustomEndpointDocumentation = endpoint.custom.openapi
+
+      if (documentation.requestBody) {
+        const key = componentName('requestBodies', singular, {
+          suffix: `CustomEndpoint${upperFirst(endpoint.method)}`,
+        })
+
+        requestBodies[key] = getRequestBodySchema(
+          `Custom endpoint request body for ${singular} with method ${endpoint.method}`,
+          documentation.requestBody,
+        )
+      }
+    }
+  }
+
+  return requestBodies
 }
 
 const generateQueryOperationSchemas = (collection: Collection): Record<string, JSONSchema4> => {
@@ -353,7 +402,40 @@ const generateCollectionResponses = (
         },
       },
     },
+    ...generateCollectionCustomEndpointResponses(collection),
   }
+}
+
+const generateCollectionCustomEndpointResponses = (
+  collection: Collection,
+): Record<string, OpenAPIV3_1.ResponseObject & OpenAPIV3.ResponseObject> => {
+  const responses: Record<string, OpenAPIV3_1.ResponseObject & OpenAPIV3.ResponseObject> = {}
+  const { singular } = collectionName(collection)
+
+  for (const endpoint of collection.config.endpoints || []) {
+    if (endpoint.custom?.openapi) {
+      const documentation: CustomEndpointDocumentation = endpoint.custom.openapi
+
+      for (const [statusCode] of Object.entries(documentation.responses || {})) {
+        const key = componentName('responses', singular, {
+          suffix: `CustomEndpoint${upperFirst(endpoint.method)}${statusCode}`,
+        })
+
+        responses[key] = {
+          description: `Custom endpoint response for ${singular} with method ${endpoint.method} and status code ${statusCode}`,
+          content: {
+            'application/json': {
+              schema: composeRef('schemas', singular, {
+                suffix: `CustomEndpoint${upperFirst(endpoint.method)}${statusCode}`,
+              }),
+            },
+          },
+        }
+      }
+    }
+  }
+
+  return responses
 }
 
 const isOpenToPublic = async (checker: Access): Promise<boolean> => {
@@ -389,7 +471,6 @@ const generateCollectionOperations = async (
   return {
     [`/api/${slug}`]: {
       get: {
-        operationId: componentName('schemas', plural, { prefix: 'list' }),
         summary: `Retrieve a list of ${plural}`,
         tags,
         parameters: [
@@ -438,7 +519,6 @@ const generateCollectionOperations = async (
         security: (await isOpenToPublic(collection.config.access.read)) ? [] : [apiKeySecurity],
       },
       post: {
-        operationId: componentName('schemas', singular, { prefix: 'create' }),
         summary: `Create a new ${singular}`,
         tags,
         parameters: createQueryParams,
@@ -463,32 +543,64 @@ const generateCollectionOperations = async (
         },
       ],
       get: {
-        operationId: componentName('schemas', singular, {
-          prefix: 'find',
-          suffix: 'ById',
-        }),
         summary: `Find a ${singular} by ID`,
         tags,
         responses: singleObjectResponses,
         security: (await isOpenToPublic(collection.config.access.read)) ? [] : [apiKeySecurity],
       },
       patch: {
-        operationId: componentName('schemas', singular, { prefix: 'update' }),
         summary: `Update a ${singular}`,
         tags,
-        requestBody: composeRef('requestBodies', singular, { suffix: 'Patch' }),
         responses: singleObjectResponses,
         security: (await isOpenToPublic(collection.config.access.update)) ? [] : [apiKeySecurity],
       },
       delete: {
-        operationId: componentName('schemas', singular, { prefix: 'delete' }),
         summary: `Delete a ${singular}`,
         tags,
         responses: singleObjectResponses,
         security: (await isOpenToPublic(collection.config.access.delete)) ? [] : [apiKeySecurity],
       },
     },
+    ...(await generateCollectionCustomEndpointOperations(collection)),
   }
+}
+
+const generateCollectionCustomEndpointOperations = async (
+  collection: Collection,
+): Promise<Record<string, OpenAPIV3.PathItemObject & OpenAPIV3_1.PathItemObject>> => {
+  const { slug } = collection.config
+  const { singular, plural } = collectionName(collection)
+  const tags = [plural]
+  const operations: Record<string, OpenAPIV3.PathItemObject & OpenAPIV3_1.PathItemObject> = {}
+
+  for (const endpoint of collection.config.endpoints || []) {
+    if (endpoint.custom?.openapi) {
+      const path = endpoint.path.replace(/\/:([^/]+)/g, '/{$1}')
+      const key = `/api/${slug}${path}`
+      const { parameters, ...documentation }: CustomEndpointDocumentation = endpoint.custom.openapi
+
+      operations[key] = {
+        ...operations[key],
+        parameters,
+        [endpoint.method]: {
+          ...documentation,
+          tags,
+          requestBody: composeRef('requestBodies', singular, {
+            suffix: `CustomEndpoint${upperFirst(endpoint.method)}`,
+          }),
+          responses: Object.entries(documentation.responses || {}).reduce((acc, [statusCode]) => {
+            acc[statusCode] = composeRef('responses', singular, {
+              suffix: `CustomEndpoint${upperFirst(endpoint.method)}${statusCode}`,
+            })
+
+            return acc
+          }, {} as OpenAPIV3_1.ResponsesObject),
+        },
+      }
+    }
+  }
+
+  return operations
 }
 
 const generateGlobalResponse = (
@@ -587,6 +699,8 @@ const generateComponents = (req: Pick<PayloadRequest, 'payload'>) => {
       req.payload.config,
       collection,
     )
+
+    Object.assign(schemas, generateCustomEndpointSchemaObjects(collection))
   }
 
   for (const collection of Object.values(req.payload.collections)) {
@@ -604,10 +718,9 @@ const generateComponents = (req: Pick<PayloadRequest, 'payload'>) => {
     requestBodies[componentName('requestBodies', singular)] = generateRequestBodySchema(
       req.payload.config,
       collection,
-      'post',
     )
-    requestBodies[componentName('requestBodies', singular, { suffix: 'Patch' })] =
-      generateRequestBodySchema(req.payload.config, collection, 'patch')
+
+    Object.assign(requestBodies, generateRequestBodyCustomEndpointSchemas(collection))
   }
 
   for (const global of req.payload.globals.config) {
